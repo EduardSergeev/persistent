@@ -21,6 +21,7 @@ import Database.Persist.TH
 import Data.Text (Text, pack)
 import Data.Aeson
 
+
 share [mkPersist sqlSettings { mpsGeneric = False }, mkDeleteCascade sqlSettings { mpsGeneric = False }] [persistUpperCase|
 Person json
     name Text
@@ -48,6 +49,18 @@ Laddress json
     city Text
     zip Int Maybe
     deriving Show Eq
+|]
+
+share [mkPersist sqlSettings { mpsGenerateNavigationProperties = True }, mkMigrate "migrateAll"] [persistUpperCase|
+
+  PurchaseOrder json
+    isActive Bool
+    deriving Show
+
+  PurchaseOrderItem json
+    isActive Bool
+    purchaseOrderId PurchaseOrderId
+    deriving Show
 |]
 
 arbitraryT :: Gen Text

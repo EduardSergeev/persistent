@@ -31,6 +31,7 @@ module Database.Persist.TH
     , mpsPrefixFields
     , mpsEntityJSON
     , mpsGenerateLenses
+    , mpsGenerateNavigationProperties
     , EntityJSON(..)
     , mkPersistSettings
     , sqlSettings
@@ -61,14 +62,14 @@ import Language.Haskell.TH.Lib (
 import Language.Haskell.TH.Quote
 import Language.Haskell.TH.Syntax
 import Data.Char (toLower, toUpper)
-import Control.Monad (forM, (<=<), mzero)
+import Control.Monad (forM, (<=<), mzero, zipWithM)
 import qualified System.IO as SIO
 import Data.Text (pack, Text, append, unpack, concat, uncons, cons, stripPrefix, stripSuffix)
 import qualified Data.Text as T
 import Data.Text.Encoding (decodeUtf8)
 import qualified Data.Text.IO as TIO
 import Data.Int (Int64)
-import Data.List (foldl')
+import Data.List (foldl', partition)
 import Data.Maybe (isJust, listToMaybe, mapMaybe, fromMaybe)
 import Data.Monoid (mappend, mconcat)
 import Text.Read (readPrec, lexP, step, prec, parens, Lexeme(Ident))
@@ -364,7 +365,7 @@ mkPersist :: MkPersistSettings -> [EntityDef] -> Q [Dec]
 mkPersist mps ents' = do
     x <- fmap Data.Monoid.mconcat $ mapM (persistFieldFromEntity mps) ents
     y <- fmap mconcat $ mapM (mkEntity entMap mps) ents
-    z <- fmap mconcat $ mapM (mkJSON mps) ents
+    z <- fmap mconcat $ mapM (mkJSON mps . addNavProperties mps entMap) ents
     return $ mconcat [x, y, z]
   where
     ents = map fixEntityDef ents'
@@ -409,6 +410,7 @@ data MkPersistSettings = MkPersistSettings
     -- Default: False
     --
     -- @since 1.3.1
+    , mpsGenerateNavigationProperties :: !Bool
     }
 
 data EntityJSON = EntityJSON
@@ -430,6 +432,7 @@ mkPersistSettings t = MkPersistSettings
         , entityFromJSON = 'entityIdFromJSON
         }
     , mpsGenerateLenses = False
+    , mpsGenerateNavigationProperties = False
     }
 
 -- | Use the 'SqlPersist' backend.
@@ -616,12 +619,15 @@ mkToPersistFields mps constr ed@EntityDef { entitySum = isSum, entityFields = fi
     go :: Q Clause
     go = do
         xs <- sequence $ replicate fieldCount $ newName "x"
-        let pat = ConP (mkName constr) $ map VarP xs
+        let ns = replicate (length navFields) WildP
+        let pat = ConP (mkName constr) $ map VarP xs `mappend` ns
         sp <- [|SomePersistField|]
         let bod = ListE $ map (AppE sp . VarE) xs
         return $ normalClause [pat] bod
 
-    fieldCount = length fields
+    -- fieldCount = length . filter (not . elem "Navigation" . fieldAttrs) $ fields
+    (navFields, persFields) = partition (elem "Navigation" . fieldAttrs) $ fields
+    fieldCount = length persFields
 
     goSum :: FieldDef -> Int -> Q Clause
     goSum fd idx = do
@@ -994,23 +1000,60 @@ fromValues t funName conE fields = do
       rightE <- [|Right|]
       return $ normalClause [ListP []] (rightE `AppE` conE)
     patternSuccess fieldsNE = do
-        x1 <- newName "x1"
-        restNames <- mapM (\i -> newName $ "x" `mappend` show i) [2..length fieldsNE]
+        ((x1,_):restNames) <- zipWithM (\i f -> (,isNavProperty f) <$> (newName $ "x" `mappend` show i)) [(1::Int)..] fieldsNE
         (fpv1:mkPersistValues) <- mapM mkPvFromFd fieldsNE
         app1E <- [|(<$>)|]
-        let conApp = infixFromPersistValue app1E fpv1 conE x1
+        let conApp = infixFromPersistValue app1E False fpv1 conE x1
         applyE <- [|(A.<*>)|]
         let applyFromPersistValue = infixFromPersistValue applyE
 
         return $ normalClause
-            [ListP $ map VarP (x1:restNames)]
-            (foldl' (\exp (name, fpv) -> applyFromPersistValue fpv exp name) conApp (zip restNames mkPersistValues))
+            [ListP $ map VarP (x1:(fmap fst . filter (not . snd) $ restNames))]
+            (foldl' (\exp ((name, isNav), fpv) -> applyFromPersistValue isNav fpv exp name) conApp (zip restNames mkPersistValues))
         where
-          infixFromPersistValue applyE fpv exp name =
-              UInfixE exp applyE (fpv `AppE` VarE name)
-          mkPvFromFd = mkPersistValue . unHaskellName . fieldHaskell
+          infixFromPersistValue applyE isNav fpv exp name
+            | isNav = UInfixE exp applyE fpv
+            | otherwise = UInfixE exp applyE (fpv `AppE` VarE name)
+          mkPvFromFd fd
+            | isNavProperty fd =
+                [|pure []|]
+            | otherwise =
+                mkPersistValue . unHaskellName . fieldHaskell $ fd
           mkPersistValue fieldName = [|mapLeft (fieldError fieldName) . fromPersistValue|]
+          isNavProperty = elem "Navigation" . fieldAttrs
 
+addNavProperties :: MkPersistSettings -> EntityMap -> EntityDef -> EntityDef
+addNavProperties mps entMap t@EntityDef{..}
+    | mpsGenerateNavigationProperties mps =
+        t { entityFields = entityFields `mappend` (fmap navProperty . backRefs entMap $ t) }
+    | otherwise =
+        t
+
+backRefs :: EntityMap -> EntityDef -> [EntityDef]
+backRefs entMap t =
+    filter (any refs . entityFields) . M.elems $ entMap
+    where
+        refs f =
+            case fieldReference f of
+                ForeignRef n _ -> n == entityHaskell t
+                _ -> False
+
+navProperty :: EntityDef -> FieldDef
+navProperty t =
+    FieldDef
+        (HaskellName . lowerFirst . (++ "s") . entityText $ t)
+        (DBName "")
+        (FTList
+            (FTApp
+                (FTTypeCon Nothing "Entity")
+                ((FTTypeCon Nothing) (entityText t))
+            )
+        )
+        SqlString
+        ["Navigation"]
+        False
+        NoReference
+        
 
 mkEntity :: EntityMap -> MkPersistSettings -> EntityDef -> Q [Dec]
 mkEntity entMap mps t = do
@@ -1018,10 +1061,10 @@ mkEntity entMap mps t = do
     let nameT = unHaskellName entName
     let nameS = unpack nameT
     let clazz = ConT ''PersistEntity `AppT` genDataType
-    tpf <- mkToPersistFields mps nameS t
-    fpv <- mkFromPersistValues mps t
+    tpf <- mkToPersistFields mps nameS . addNavProperties mps entMap $ t
+    fpv <- mkFromPersistValues mps . addNavProperties mps entMap $ t
     utv <- mkUniqueToValues $ entityUniques t
-    puk <- mkUniqueKeys t
+    puk <- mkUniqueKeys . addNavProperties mps entMap $ t
     fkc <- mapM (mkForeignKeysComposite mps t) $ entityForeigns t
 
     let primaryField = entityId t
@@ -1044,8 +1087,7 @@ mkEntity entMap mps t = do
     lenses <- mkLenses mps t
     let instanceConstraint = if not (mpsGeneric mps) then [] else
           [mkClassP ''PersistStore [backendT]]
-
-    dtd <- dataTypeDec mps t
+    dtd <- dataTypeDec mps . addNavProperties mps entMap $ t
     return $ addSyn $
        dtd : mconcat fkc `mappend`
       ([ TySynD (keyIdName t) [] $
