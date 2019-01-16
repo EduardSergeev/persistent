@@ -1084,7 +1084,7 @@ mkEntity entMap mps t = do
 
     lensClauses <- mkLensClauses mps t
 
-    lenses <- mkLenses mps t
+    lenses <- mkLenses mps . addNavProperties mps entMap $ t
     let instanceConstraint = if not (mpsGeneric mps) then [] else
           [mkClassP ''PersistStore [backendT]]
     dtd <- dataTypeDec mps . addNavProperties mps entMap $ t

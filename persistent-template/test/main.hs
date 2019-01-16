@@ -51,7 +51,7 @@ Laddress json
     deriving Show Eq
 |]
 
-share [mkPersist sqlSettings { mpsGenerateNavigationProperties = True }, mkMigrate "migrateAll"] [persistUpperCase|
+share [mkPersist sqlSettings { mpsGenerateNavigationProperties = True, mpsGenerateLenses = True }, mkMigrate "migrateAll"] [persistUpperCase|
 
   PurchaseOrder json
     isActive Bool
